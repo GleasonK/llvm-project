@@ -21,12 +21,14 @@
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/ExtensibleDialect.h"
 #include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/OpImplementation.h"
 #include "mlir/IR/OperationSupport.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Interfaces/InferIntRangeInterface.h"
 #include "mlir/Reducer/ReductionPatternInterface.h"
+#include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/FoldUtils.h"
 #include "mlir/Transforms/InliningUtils.h"
 #include "llvm/ADT/SmallString.h"
@@ -71,7 +73,7 @@ struct TestResourceBlobManagerInterface
 struct TestOpAsmInterface : public OpAsmDialectInterface {
   using OpAsmDialectInterface::OpAsmDialectInterface;
   TestOpAsmInterface(Dialect *dialect, TestResourceBlobManagerInterface &mgr)
-      : OpAsmDialectInterface(dialect), blobManager(mgr) {}
+      : OpAsmDialectInterface(dialect), blobManager(mgr), converter(dialect) {}
 
   //===------------------------------------------------------------------===//
   // Aliases
@@ -161,9 +163,67 @@ struct TestOpAsmInterface : public OpAsmDialectInterface {
     blobManager.buildResources(provider, referencedResources.getArrayRef());
   }
 
+  //===------------------------------------------------------------------===//
+  // Versioning
+  //===------------------------------------------------------------------===//
+  class TestDialectVersionConverter : public DialectVersionConverter {
+  public:
+    TestDialectVersionConverter(Dialect * dialect) 
+      : DialectVersionConverter(dialect) 
+    {
+        // Upgrade to 40
+      addUpgrade(
+          "test_upgrade", getVersion(40),
+          [&](Operation *op, Attribute fromVer) {
+            op->setAttr("upgraded_from", fromVer);
+            op->setAttr("upgraded_to", getVersion(40));
+            auto n = op->getAttr("num_upgrades").cast<IntegerAttr>().getInt();
+            op->setAttr("num_upgrades", getVersion(n + 1));
+            return success();
+          });
+
+      // Upgrade to 39 - upgrades will happen sequentialls no matter
+      // registration order.
+      addUpgrade("test_upgrade", getVersion(39), [&](Operation *op, Attribute) {
+        op->setAttr("num_upgrades", getVersion(1));
+        return success();
+      });
+
+      // Downgrade to 38
+      addDowngrade("test_upgrade", getVersion(38),
+                   [&](Operation *op, Attribute fromVer) {
+                     op->setAttr("downgraded_from", fromVer);
+                     op->setAttr("downgraded_to", getVersion(38));
+                     return success();
+                   });
+    } 
+
+    Attribute getProducerVersion() const final {
+      return getVersion(40);
+    }
+    Attribute getDialectTargetVersionForDowngrade() const final {
+      return getVersion(38);
+    }
+    Attribute getMinimumProducerDialectVersion() const final {
+      return getVersion(35);
+    }
+    bool lessThan(Attribute const &a, Attribute const &b) const final {
+      return a.cast<IntegerAttr>().getInt() < b.cast<IntegerAttr>().getInt();
+    }
+  private:
+    Attribute getVersion(int64_t ver) const {
+      return Builder(getDialect()->getContext()).getI32IntegerAttr(ver);
+    }
+  };
+
+  DialectVersionConverter * getDialectVersionConverter() final {
+    return &converter;
+  }
+  
 private:
   /// The blob manager for the dialect.
   TestResourceBlobManagerInterface &blobManager;
+  TestDialectVersionConverter converter;
 };
 
 struct TestDialectFoldInterface : public DialectFoldInterface {

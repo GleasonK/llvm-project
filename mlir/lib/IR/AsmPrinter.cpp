@@ -27,7 +27,9 @@
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/SubElementInterfaces.h"
 #include "mlir/IR/Verifier.h"
+#include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
@@ -45,6 +47,7 @@
 #include "llvm/Support/SaveAndRestore.h"
 #include "llvm/Support/Threading.h"
 
+#include <cstdint>
 #include <tuple>
 
 using namespace mlir;
@@ -120,6 +123,127 @@ OpAsmDialectInterface::parseResource(AsmParsedResourceEntry &entry) const {
                            << "'";
 }
 
+namespace {
+LogicalResult
+walkAndApply(Operation *topLevelOp,
+             std::function<FailureOr<Attribute>(Operation *, Attribute const &,
+                                                DialectVersionConverter *)>
+                 cb) {
+  // Perform any upgrades
+  // FIXME: This version number would need to come from the dialect_resources:
+  auto getVersionFn = [&](Operation *op) -> Attribute {
+    char *envVar = std::getenv("OP_VERSION");
+    auto versionStr = std::string(envVar ? envVar : "");
+    if (versionStr.empty())
+      versionStr = "1";
+
+    return Builder(op->getContext())
+        .getI32IntegerAttr(atoi(versionStr.c_str()));
+  };
+  auto walkRes = topLevelOp->walk([&](Operation *op) {
+    llvm::dbgs() << "Getting dialect version for "
+                 << op->getName().getStringRef() << '\n';
+    Attribute version = getVersionFn(op);
+    if (!version)
+      return WalkResult::advance();
+
+    FailureOr<Attribute> attrOrFail(version);
+
+    llvm::dbgs() << "Iterating on conversions...\n";
+    do {
+      // Upgrade failed, interrupt and error.
+      // Get this every time in case upgrade changes op dialect.
+      llvm::dbgs() << "Getting interface for " << op->getName().getStringRef()
+                   << '\n';
+      auto *dialect = op->getDialect();
+      if (!dialect)
+        return WalkResult::advance();
+
+      auto *asmIface = dialect->getRegisteredInterface<OpAsmDialectInterface>();
+      if (!asmIface || !asmIface->getDialectVersionConverter())
+        return WalkResult::advance();
+
+      llvm::dbgs() << "Attempting to apply conversion to "
+                   << op->getName().getStringRef() << '\n';
+      // Iteratively apply upgrades until none are applied.
+      version = *attrOrFail; // Update the minimum version.
+      attrOrFail = cb(op, version, asmIface->getDialectVersionConverter());
+
+      if (failed(attrOrFail)) {
+        // Upgrade failed, interrupt and error.
+        op->emitError("op failed upgrade conversion");
+        return WalkResult::interrupt();
+      }
+
+      llvm::dbgs() << "Applied conversion = " << (*attrOrFail != version)
+                   << '\n';
+    } while (*attrOrFail != version);
+    return WalkResult::advance();
+  });
+
+  return success(/*isSuccess=*/!walkRes.wasInterrupted());
+}
+} // namespace
+
+LogicalResult DialectVersionConverter::applyOpUpgrades(Operation *topLevelOp) {
+  return walkAndApply(topLevelOp, [](Operation *op, Attribute const &attr,
+                                      DialectVersionConverter *converter) {
+    return converter->upgrade(op, attr);
+  });
+}
+
+LogicalResult DialectVersionConverter::applyOpDowngrades(Operation *topLevelOp) {
+  return walkAndApply(topLevelOp, [](Operation *op, Attribute const &attr,
+                                      DialectVersionConverter *converter) {
+    return converter->downgrade(op, attr);
+  });
+}
+
+FailureOr<Attribute> DialectVersionConverter::applyConversion(
+      Operation *op, Attribute const &version,
+      llvm::StringMap<llvm::SmallVector<OpConversionAttributePair>> &map,
+      std::function<bool(Attribute, Attribute)> const &comparisonFn) {
+
+    // Find if any conversions for this given op are registered.
+    OperationName mnemonic = op->getName();
+    auto it = map.find(mnemonic.stripDialect());
+
+    // No conversions, return original version.
+    if (it == map.end()) {
+      return version;
+    }
+
+    // Sort the conversions for this given attribute and see if any can be
+    // applied.
+    // This will either sort in ascending or descending order depending on
+    // comparisonFn.
+    //
+    // Sort on every conversion may be costly, can consider refactoring.
+    llvm::SmallVector<OpConversionAttributePair> &conversions = it->second;
+    std::sort(conversions.begin(), conversions.end(),
+              [&](OpConversionAttributePair const &a,
+                  OpConversionAttributePair const &b) {
+                return comparisonFn(a.version, b.version);
+              });
+
+    // Iterate over conversions, if one is greater than version argument, apply
+    // it and modify version.
+    for (auto &convPair : conversions) {
+      if (comparisonFn(version, convPair.version)) {
+        // If conversion was attempted, return failure or new attribute version.
+        if (failed(convPair.conversion(op, version))) {
+          return op->emitError(
+              "failed applying a conversaion"); // Notify of conversion failure.
+        }
+        assert(convPair.version != version); // Must always increase/decrease.
+        return convPair.version; // Return the new version
+      }
+    }
+
+    // No conversions applied, return original version.
+    return version;
+  }
+
 //===----------------------------------------------------------------------===//
 // OpPrintingFlags
 //===----------------------------------------------------------------------===//
@@ -168,6 +292,10 @@ struct AsmPrinterOptions {
       "mlir-print-value-users", llvm::cl::init(false),
       llvm::cl::desc(
           "Print users of operation results and block arguments as a comment")};
+
+  llvm::cl::opt<bool> printWithDowngrades{
+      "mlir-print-with-downgrades", llvm::cl::init(false),
+      llvm::cl::desc("Apply any dialect op downgrades before printing")};
 };
 } // namespace
 
@@ -184,7 +312,8 @@ void mlir::registerAsmPrinterCLOptions() {
 OpPrintingFlags::OpPrintingFlags()
     : printDebugInfoFlag(false), printDebugInfoPrettyFormFlag(false),
       printGenericOpFormFlag(false), assumeVerifiedFlag(false),
-      printLocalScope(false), printValueUsersFlag(false) {
+      printLocalScope(false), printValueUsersFlag(false),
+      printWithDowngrades(false) {
   // Initialize based upon command line options, if they are available.
   if (!clOptions.isConstructed())
     return;
@@ -196,6 +325,7 @@ OpPrintingFlags::OpPrintingFlags()
   assumeVerifiedFlag = clOptions->assumeVerifiedOpt;
   printLocalScope = clOptions->printLocalScopeOpt;
   printValueUsersFlag = clOptions->printValueUsers;
+  printWithDowngrades = clOptions->printWithDowngrades;
 }
 
 /// Enable the elision of large elements attributes, by printing a '...'
@@ -280,6 +410,11 @@ bool OpPrintingFlags::shouldUseLocalScope() const { return printLocalScope; }
 /// Return if the printer should print users of values.
 bool OpPrintingFlags::shouldPrintValueUsers() const {
   return printValueUsersFlag;
+}
+
+/// Return if the printer should apply op dialect downgrades.
+bool OpPrintingFlags::shouldApplyDowngrades() const {
+  return printWithDowngrades;
 }
 
 /// Returns true if an ElementsAttr with the given number of elements should be
@@ -2819,9 +2954,17 @@ private:
   // This is the current indentation level for nested structures.
   unsigned currentIndent = 0;
 };
+
 } // namespace
 
 void OperationPrinter::printTopLevelOperation(Operation *op) {
+  // Apply downgrades if required.
+  if (printerFlags.shouldApplyDowngrades() &&
+      failed(DialectVersionConverter::applyOpDowngrades(op))) {
+    op->emitError("failed to apply downgrades");
+    return;
+  }
+
   // Output the aliases at the top level that can't be deferred.
   state.getAliasState().printNonDeferredAliases(os, newLine);
 

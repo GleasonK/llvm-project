@@ -3008,4 +3008,15 @@ def TestReflectBoundsOp : TEST_Op<"reflect_bounds",
 
   let assemblyFormat = "attr-dict $value";
 }
+
+
+//===----------------------------------------------------------------------===//
+// Test Versioning
+//===----------------------------------------------------------------------===//
+def TestUpgrades : TEST_Op<"test_upgrade"> {
+  let arguments = (ins I32Attr:$curr_version);
+  let results = (outs Index:$result);
+
+  let assemblyFormat = "$curr_version attr-dict `:` functional-type(operands, results)";
+}
 #endif // TEST_OPS

@@ -13,11 +13,17 @@
 #ifndef MLIR_IR_OPIMPLEMENTATION_H
 #define MLIR_IR_OPIMPLEMENTATION_H
 
+#include "mlir/IR/Attributes.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/DialectInterface.h"
 #include "mlir/IR/OpDefinition.h"
+#include "mlir/Support/LogicalResult.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/SMLoc.h"
+
 
 namespace mlir {
 class AsmParsedResourceEntry;
@@ -1503,6 +1509,172 @@ public:
 };
 
 //===--------------------------------------------------------------------===//
+// Versioning
+//===--------------------------------------------------------------------===//
+
+/// Class used for upgrade and downgrade hook management / appliction.
+/// Optionally applied during asm printing using `--mlir-print-with-downgrades`
+/// Always applied during bytecode serialization / deserialization.
+///
+/// This allows for the following types of changes:
+///  - Operation/Attribute renames
+///  - Move an operation to a different dialect
+///  - Adding an attribute (assuming default value for upgrade is possible)
+///  - Removing an attribute from an op (can't delete attribute datatype)
+///  - Changing attribute into an operand / adding an operand (need to think more)
+///    + TODO: Need to think more if current infrastructure allows for the above
+///      Not sure if the "walk and edit" mechanism allows for replacing with multiple
+///      ops.
+class DialectVersionConverter {
+public:
+  /// Version converter functions are used for both upgrade and downgrade.
+  /// They take an `Operation *` for the operation to be conveted, as well as
+  /// an Attribute that represents the dialect version.
+  ///
+  /// The Attribute argument may not be needed if the infrastructure handles
+  /// these changes. I.e. upgrades will simply know to "upgrade from the
+  /// version right before this one".
+  using OpVersionConverterFn =
+      std::function<LogicalResult(Operation *, Attribute)>;
+
+  DialectVersionConverter(Dialect *dialect)
+      : dialect(dialect), upgrades(), downgrades() {}
+
+  virtual ~DialectVersionConverter() = default;
+
+  Dialect const *getDialect() const { return dialect; }
+  Dialect *getDialect() { return dialect; }
+
+  /// This is the current dialect bytecode version.
+  ///
+  /// This is the number that will be passed to upgrade passes.
+  ///
+  /// An error/warning will be displayed if the bytecode version greater
+  /// than 42. Note: Version 43 should target v42 bytecode for 3 weeks. If the
+  /// producer version is greater than 42, that means the forward compatibility
+  /// window is closed.
+  virtual Attribute getProducerVersion() const = 0;
+
+  /// This is the current dialect bytecode version.
+  ///
+  /// An error/warning will be displayed if the bytecode version is less
+  /// than 35.
+  virtual Attribute getMinimumProducerDialectVersion() const = 0;
+
+  /// The target version will need to be manually managed.
+  /// It should be set to the `getProducerDialectVersion` of a revision
+  /// from <forward_compatibility_window> days in the past.
+  ///
+  /// This is the number that will be passed to downgrade passes.
+  ///
+  /// The default implementation of this function will call
+  /// getProducerDialectVersion, implying no downgrades.
+  ///
+  /// The attribute returned from `getDialectTargetVersionForDowngrade` will be
+  /// added to the dialect resources in the bytecoded file. This is taken care
+  /// of by the BytecodeDialectInterface during bytecode writing. If this method
+  /// returns a null attribute, no version is written.
+  ///
+  /// Post-condition: `getDialectTargetVersionForDowngrade() <=
+  /// getProducerDialectVersion()`. If this method is implemented,
+  /// `getProducerDialectVersion` must return a non-null attribute.
+  virtual Attribute getDialectTargetVersionForDowngrade() const {
+    return getProducerVersion();
+  }
+
+  /// Implement a comparator method for attribute versions.
+  /// This is necessary to ensure that conversions will eventually converge
+  /// as version will always increase (upgrades) or always decrease
+  /// (downgrades).
+  virtual bool lessThan(Attribute const &a, Attribute const &b) const = 0;
+
+  /// Add an upgrade/downgrade pass for an Operation that matches @param
+  /// mnemonic.
+  ///
+  /// Given that operations being deserialized here may no longer exist, this
+  /// machinery needs to operate on mnemonic and pass an `Operation*` for
+  /// upgrade.
+  ///
+  /// This machinery allows for handling renames, deletes, and other
+  /// modifications.
+  ///
+  /// An upgrade callback will be invoked if the op matches the mnemonic, and
+  /// the registered version is greater than the ops current version. An op will
+  /// continue calling upgrades until all registered upgrades for a given
+  /// mnemonic are invalid or return failure.
+  ///
+  /// If an upgrade succeeds, the ops "current version" is assigned to the
+  /// registered version of the upgrade callback. This prevents infinite
+  /// recursion, since version attributes are monotonically increasing.
+  ///
+  /// The inverse must be true for downgrades, calling only if version is less
+  /// than the ops current version, with a monotonically decreasing version
+  /// attribute.
+  void addUpgrade(llvm::StringRef mnemonic, Attribute version,
+                  OpVersionConverterFn const & cb) {
+    if (lessThan(version, getMinimumProducerDialectVersion())) {
+      // Downgrade callback will never be used.
+      mlir::emitError(mlir::UnknownLoc::get(getDialect()->getContext()))
+          << "attempt to add upgrade that is less than supported dialect version: "
+          << version;
+      return;
+    }
+
+    upgrades[mnemonic].push_back({cb, version});
+  }
+  void addDowngrade(llvm::StringRef mnemonic, Attribute version,
+                    OpVersionConverterFn const & cb) {
+    if (lessThan(version, getDialectTargetVersionForDowngrade())) {
+      // Downgrade callback will never be used.
+      mlir::emitError(mlir::UnknownLoc::get(getDialect()->getContext()))
+          << "attempt to add downgrade that is less than target dialect verison: "
+          << version;
+      return;
+    }
+
+    downgrades[mnemonic].push_back({cb, version});
+  }
+
+  FailureOr<Attribute> upgrade(Operation * op, Attribute const & version) {
+    // Apply conversion if op version is less than conversion function version.
+    return applyConversion(op, version, upgrades, [&](Attribute opVersion, Attribute convVersion) {
+      return lessThan(opVersion, convVersion);
+    });
+  }
+
+  FailureOr<Attribute> downgrade(Operation * op, Attribute const & version) {
+    // Apply conversion if conversion version is less than op version.
+    return applyConversion(op, version, downgrades, [&](Attribute opVersion, Attribute convVersion) {
+      return lessThan(convVersion, opVersion);
+    });
+  }
+
+  static LogicalResult applyOpUpgrades(Operation *topLevelOp); 
+
+  static LogicalResult applyOpDowngrades(Operation * topLevelOp);
+
+private: 
+  struct OpConversionAttributePair {
+    OpVersionConverterFn conversion;
+    Attribute version;
+  };
+
+  /// This function attempts to apply a single conversion to @param op.
+  ///
+  /// Returns `failure` iff a conversion was attempted to be applied and failed.
+  /// Returns @param version if no conversaions were applied.
+  /// Returns a new attribute representing the new version of an op if conversion was applied.
+  FailureOr<Attribute> applyConversion(
+      Operation *op, Attribute const &version,
+      llvm::StringMap<llvm::SmallVector<OpConversionAttributePair>> &map,
+      std::function<bool(Attribute, Attribute)> const &comparisonFn);
+
+  Dialect *dialect;
+  llvm::StringMap<llvm::SmallVector<OpConversionAttributePair>> upgrades;
+  llvm::StringMap<llvm::SmallVector<OpConversionAttributePair>> downgrades;
+};
+
+//===--------------------------------------------------------------------===//
 // Dialect OpAsm interface.
 //===--------------------------------------------------------------------===//
 
@@ -1580,7 +1752,16 @@ public:
   buildResources(Operation *op,
                  const SetVector<AsmDialectResourceHandle> &referencedResources,
                  AsmResourceBuilder &builder) const {}
+
+  //===--------------------------------------------------------------------===//
+  // Versioning
+  //===--------------------------------------------------------------------===//
+  // Todo: this shouldn't return a pointer
+  virtual DialectVersionConverter * getDialectVersionConverter() {
+    return nullptr;
+  }
 };
+
 } // namespace mlir
 
 //===--------------------------------------------------------------------===//

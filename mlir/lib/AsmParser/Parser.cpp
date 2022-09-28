@@ -19,7 +19,9 @@
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Dialect.h"
+#include "mlir/IR/OpImplementation.h"
 #include "mlir/IR/Verifier.h"
+#include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/StringSet.h"
@@ -800,6 +802,11 @@ ParseResult OperationParser::finalize() {
   // Pop the top level name scope.
   if (failed(popSSANameScope()))
     return failure();
+
+  // Apply upgrades before verification
+  if (failed(DialectVersionConverter::applyOpUpgrades(topLevelOp))) {
+    return failure();
+  }
 
   // Verify that the parsed operations are valid.
   if (state.config.shouldVerifyAfterParse() && failed(verify(topLevelOp)))

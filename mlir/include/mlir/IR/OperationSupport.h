@@ -812,6 +812,9 @@ public:
   /// Return if the printer should print users of values.
   bool shouldPrintValueUsers() const;
 
+  /// Return if the printer should downgrade before print
+  bool shouldApplyDowngrades() const;
+
 private:
   /// Elide large elements attributes if the number of elements is larger than
   /// the upper limit.
@@ -832,6 +835,9 @@ private:
 
   /// Print users of values.
   bool printValueUsersFlag : 1;
+
+  /// Apply downgrades
+  bool printWithDowngrades : 1;
 };
 
 //===----------------------------------------------------------------------===//
