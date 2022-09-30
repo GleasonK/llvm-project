@@ -2,6 +2,7 @@ add_mlir_library(MLIRIR
   AffineExpr.cpp
   AffineMap.cpp
   AsmPrinter.cpp
+  AsmVersioning.cpp
   Attributes.cpp
   Block.cpp
   Builders.cpp

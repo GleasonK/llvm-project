@@ -168,35 +168,45 @@ struct TestOpAsmInterface : public OpAsmDialectInterface {
   //===------------------------------------------------------------------===//
   class TestDialectVersionConverter : public DialectVersionConverter {
   public:
-    TestDialectVersionConverter(Dialect * dialect) 
-      : DialectVersionConverter(dialect) 
-    {
-        // Upgrade to 40
-      addUpgrade(
-          "test_upgrade", getVersion(40),
-          [&](Operation *op, Attribute fromVer) {
-            op->setAttr("upgraded_from", fromVer);
-            op->setAttr("upgraded_to", getVersion(40));
-            auto n = op->getAttr("num_upgrades").cast<IntegerAttr>().getInt();
-            op->setAttr("num_upgrades", getVersion(n + 1));
-            return success();
-          });
+    TestDialectVersionConverter(Dialect *dialect)
+        : DialectVersionConverter(dialect) {
+      // Change log:
+      //   Version 38: No attribute
+      //   Version 39: Added attr version_39_attr
+      //   Version 40: Rename attr version_39_attr --> version_40_attr
+      // Backward compatibility: Support v38 and after.
+      // Forward compatibility: Target v39 for printing.
 
-      // Upgrade to 39 - upgrades will happen sequentialls no matter
-      // registration order.
+      // Upgrade v39 -> 40: [version_39_attr --> version_40_attr]
+      addUpgrade("test_upgrade", getVersion(40),
+                 [&](Operation *op, Attribute fromVer) -> LogicalResult {
+                   if (!op->hasAttr("version_39_attr")) {
+                     return op->emitError(
+                         "expected version_39_attr for upgrade.");
+                   }
+                   op->setAttr("version_40_attr", op->getAttr("version_39_attr"));
+                   op->removeAttr("version_39_attr");
+                   return success();
+                 });
+
+      // Upgrade <v39 -> 39: [() --> version_39_attr]
       addUpgrade("test_upgrade", getVersion(39), [&](Operation *op, Attribute) {
-        op->setAttr("num_upgrades", getVersion(1));
+        op->setAttr("version_39_attr", getVersion(1));
         return success();
       });
 
-      // Downgrade to 38
-      addDowngrade("test_upgrade", getVersion(38),
-                   [&](Operation *op, Attribute fromVer) {
-                     op->setAttr("downgraded_from", fromVer);
-                     op->setAttr("downgraded_to", getVersion(38));
+      // Downgrade v40 -> v39
+      addDowngrade("test_upgrade", getVersion(39),
+                   [&](Operation *op, Attribute fromVer) -> LogicalResult {
+                     if (!op->hasAttr("version_40_attr")) {
+                       return op->emitError(
+                           "expected version_40_attr for downrade.");
+                     }
+                     op->setAttr("version_39_attr", op->getAttr("version_40_attr"));
+                     op->removeAttr("version_40_attr");
                      return success();
                    });
-    } 
+    }
 
     Attribute getProducerVersion() const final {
       return getVersion(40);
@@ -210,7 +220,9 @@ struct TestOpAsmInterface : public OpAsmDialectInterface {
     bool lessThan(Attribute const &a, Attribute const &b) const final {
       return a.cast<IntegerAttr>().getInt() < b.cast<IntegerAttr>().getInt();
     }
+
   private:
+    /// Helper function to get a version as an integer attr
     Attribute getVersion(int64_t ver) const {
       return Builder(getDialect()->getContext()).getI32IntegerAttr(ver);
     }

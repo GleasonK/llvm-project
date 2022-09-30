@@ -3014,9 +3014,13 @@ def TestReflectBoundsOp : TEST_Op<"reflect_bounds",
 // Test Versioning
 //===----------------------------------------------------------------------===//
 def TestUpgrades : TEST_Op<"test_upgrade"> {
-  let arguments = (ins I32Attr:$curr_version);
+  // Change log:
+  //   Version 38: No attribute
+  //   Version 39: Added attr version_39_attr
+  //   Version 40: Rename attr version_39_attr --> version_40_attr
+  // Forward compatibility: Target v39 for printing.
+  // Backward compatibility: Support v38 and after.
+  let arguments = (ins I32Attr:$version_40_attr);
   let results = (outs Index:$result);
-
-  let assemblyFormat = "$curr_version attr-dict `:` functional-type(operands, results)";
 }
 #endif // TEST_OPS
